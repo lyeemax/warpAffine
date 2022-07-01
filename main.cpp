@@ -271,7 +271,7 @@ double linearize(const std::vector<Eigen::Vector3d> &circle,const int &level,con
 
         for (int j = 0; j < patch_size * patch_size; ++j) {
             double intensity_error = static_cast<double>(patch_ptr_b[j] - patch_ptr_a[j]);
-            intensity_error *= get_huber_loss_scale(intensity_error, 20);
+            intensity_error *= get_huber_loss_scale(intensity_error, 10);
             sum_res += intensity_error * intensity_error;
             if (calJ) {
                 Eigen::Matrix<double, 1, 2> mat_photometric;
@@ -291,6 +291,187 @@ double linearize(const std::vector<Eigen::Vector3d> &circle,const int &level,con
     }
     return sum_res;
 }
+inline void createPatchFromPatchWithBorder(
+        const uint8_t* const patch_with_border,
+        const int patch_size,
+        uint8_t* patch)
+{
+    uint8_t* patch_ptr = patch;
+    for(int y=1; y<patch_size+1; ++y, patch_ptr += patch_size)
+    {
+        const uint8_t* ref_patch_border_ptr = patch_with_border + y*(patch_size+2) + 1;
+        for(int x=0; x<patch_size; ++x)
+            patch_ptr[x] = ref_patch_border_ptr[x];
+    }
+}
+
+bool align2D(
+        const cv::Mat& cur_img,
+        uint8_t* ref_patch_with_border,
+        uint8_t* ref_patch,
+        const int n_iter,
+        const bool affine_est_offset,
+        const bool affine_est_gain,
+        Eigen::Vector2d & cur_px_estimate,
+        bool no_simd,
+        std::vector<Eigen::Vector2f> *each_step)
+{
+
+    if(each_step) each_step->clear();
+
+    const int halfpatch_size_ = 4;
+    const int patch_size_ = 8;
+    const int patch_area_ = 64;
+    bool converged=false;
+
+    // We optimize feature position and two affine parameters.
+    // compute derivative of template and prepare inverse compositional
+    float __attribute__((__aligned__(16))) ref_patch_dx[patch_area_];
+    float __attribute__((__aligned__(16))) ref_patch_dy[patch_area_];
+    Eigen::Matrix4f H; H.setZero();
+
+    // compute gradient and hessian
+    const int ref_step = patch_size_+2;
+    float* it_dx = ref_patch_dx;
+    float* it_dy = ref_patch_dy;
+    for(int y=0; y<patch_size_; ++y)
+    {
+        uint8_t* it = ref_patch_with_border + (y+1)*ref_step + 1;//start form ref_patch_with_border(1,1)
+        for(int x=0; x<patch_size_; ++x, ++it, ++it_dx, ++it_dy)
+        {
+            Eigen::Vector4f J;
+            J[0] = 0.5 * (it[1] - it[-1]);//ref_patch_with_border(2,1)-ref_patch_with_border(0,1);
+            J[1] = 0.5 * (it[ref_step] - it[-ref_step]);//ref_patch_with_border(1,2)-ref_patch_with_border(1,0);
+
+            // If not using the affine compensation, force the jacobian to be zero.
+            J[2] = affine_est_offset? 1.0 : 0.0;
+            J[3] = affine_est_gain? -1.0*it[0]: 0.0;
+
+            *it_dx = J[0];
+            *it_dy = J[1];
+            H += J*J.transpose();
+        }
+    }
+    // If not use affine compensation, force update to be zero by
+    // * setting the affine parameter block in H to identity
+    // * setting the residual block to zero (see below)
+    if(!affine_est_offset)
+    {
+        H(2, 2) = 1.0;
+    }
+    if(!affine_est_gain)
+    {
+        H(3, 3) = 1.0;
+    }
+    Eigen::Matrix4f Hinv = H.inverse();
+    float mean_diff = 0;
+    float alpha = 1.0;
+
+    // Compute pixel location in new image:
+    float u = cur_px_estimate.x();
+    float v = cur_px_estimate.y();
+
+    if(each_step) each_step->push_back(Eigen::Vector2f(u, v));
+
+    // termination condition
+    const float min_update_squared = 0.03*0.03; // TODO I suppose this depends on the size of the image (ate)
+    const int cur_step = cur_img.step.p[0];
+    //float chi2 = 0;
+    Eigen::Vector4f update; update.setZero();
+    for(int iter = 0; iter<n_iter; ++iter)
+    {
+        int u_r = std::floor(u);
+        int v_r = std::floor(v);
+        if(u_r < halfpatch_size_
+           || v_r < halfpatch_size_
+           || u_r >= cur_img.cols-halfpatch_size_
+           || v_r >= cur_img.rows-halfpatch_size_)
+            break;
+
+        if(std::isnan(u) || std::isnan(v)) // TODO very rarely this can happen, maybe H is singular? should not be at corner.. check
+            return false;
+
+        // compute interpolation weights
+        float subpix_x = u-u_r;
+        float subpix_y = v-v_r;
+        float wTL = (1.0-subpix_x)*(1.0-subpix_y);
+        float wTR = subpix_x * (1.0-subpix_y);
+        float wBL = (1.0-subpix_x)*subpix_y;
+        float wBR = subpix_x * subpix_y;
+
+        // loop through search_patch, interpolate
+        uint8_t* it_ref = ref_patch;
+        float* it_ref_dx = ref_patch_dx;
+        float* it_ref_dy = ref_patch_dy;
+        //float new_chi2 = 0.0;
+        Eigen::Vector4f Jres; Jres.setZero();
+        for(int y=0; y<patch_size_; ++y)
+        {
+            uint8_t* it = (uint8_t*) cur_img.data + (v_r+y-halfpatch_size_)*cur_step + u_r-halfpatch_size_;
+            for(int x=0; x<patch_size_; ++x, ++it, ++it_ref, ++it_ref_dx, ++it_ref_dy)
+            {
+                float search_pixel = wTL*it[0] + wTR*it[1] + wBL*it[cur_step] + wBR*it[cur_step+1];
+                float res = search_pixel - alpha*(*it_ref) + mean_diff;
+                Jres[0] -= res*(*it_ref_dx);
+                Jres[1] -= res*(*it_ref_dy);
+
+                // If affine compensation is used,
+                // set Jres with respect to affine parameters.
+                if(affine_est_offset)
+                {
+                    Jres[2] -= res;
+                }
+
+                if(affine_est_gain)
+                {
+                    Jres[3] -= (-1)*res*(*it_ref);
+                }
+                //new_chi2 += res*res;
+            }
+        }
+        // If not use affine compensation, force update to be zero.
+        if(!affine_est_offset)
+        {
+            Jres[2] = 0.0;
+        }
+        if(!affine_est_gain)
+        {
+            Jres[3] = 0.0;
+        }
+        /*
+        if(iter > 0 && new_chi2 > chi2)
+        {
+    #if SUBPIX_VERBOSE
+          cout << "error increased." << endl;
+    #endif
+          u -= update[0];
+          v -= update[1];
+          break;
+        }
+        chi2 = new_chi2;
+    */
+        update = Hinv * Jres;
+        u += update[0];
+        v += update[1];
+        mean_diff += update[2];
+        alpha += update[3];
+
+        if(each_step) each_step->push_back(Eigen::Vector2f(u, v));
+
+
+        if(update[0]*update[0]+update[1]*update[1] < min_update_squared)
+        {
+            converged=true;
+            break;
+        }
+    }
+
+    cur_px_estimate << u, v;
+    (void)no_simd;
+
+    return converged;
+}
+
 int main() {
     //generate pattern in world
     std::vector<Eigen::Vector3d> circle;//in A frame,ref
@@ -445,7 +626,7 @@ int main() {
     const int halfpatch_size=4;
     const int patch_size=halfpatch_size*2;
 
-    if(1){
+    if(0){
         //set initial guess,recall GT:
         //Eigen::Vector3d t(10,0,0);
         //Eigen::AngleAxisd ry=Eigen::AngleAxisd(-M_PI/4.0,Eigen::Vector3d::UnitY());
@@ -505,11 +686,10 @@ int main() {
 
             last_sum_res=linearize(circle, level, TBA_dis,Wlevel, K, search_level, patch_size, halfpatch_size, imgAPyr, imgBPyr, true, idx, Js, Res,valid_idx,init);
             init= false;
-            H.setZero();
-            B.setZero();
-
             std::cout<<"ave error "<<last_sum_res/float(idx*patch_size*patch_size)<<std::endl;
 
+            H.setZero();
+            B.setZero();
             for (int i = 0; i < valid_idx.size(); ++i) {
                 for (int j = 0; j < patch_size*patch_size; ++j) {
                     H.noalias()+=Js[i][j].transpose()*Js[i][j];
@@ -652,6 +832,7 @@ int main() {
                 uint8_t *patch_ptr_b = B_patch_ptr;
                 computeCurrentFeaturePatch(uvb, patch_size, imgBPyr[search_level], patch_ptr_b, nullptr, nullptr);
 
+
                 double error=0;
                 for (int j = 0; j < patch_size*patch_size; ++j) {
                     error+=fabs(patch_ptr_b[j]-patch_ptr_a[j]);
@@ -684,6 +865,42 @@ int main() {
 
     }
 
+    std::vector<cv::KeyPoint> ref_pts,cur_pts;
+    std::vector<cv::DMatch> matches;
+    for (int i = 0; i < circle.size(); i+=10) {
+        Eigen::Vector3d pa = circle[i];
+        pa /= pa.z();
+        Eigen::Vector2d uva = (K * pa).topLeftCorner<2, 1>();
+
+
+        uint8_t A_patch_ptr_wb[(patch_size+1) * (patch_size+1)]  __attribute__ ((aligned (16)));
+        uint8_t *patch_ptr_a_wb = A_patch_ptr_wb;
+
+        uint8_t A_patch_ptr[(patch_size) * (patch_size)]  __attribute__ ((aligned (16)));
+        uint8_t *patch_ptr_a= A_patch_ptr;
+
+        make_patch_with_warp(halfpatch_size+1, uva, imgAPyr[0], patch_ptr_a_wb, Wba);//ref
+        createPatchFromPatchWithBorder(patch_ptr_a_wb,patch_size,patch_ptr_a);
+
+        Sophus::SE3d TAB_dis(Eigen::AngleAxisd(-M_PI / 4.1, Eigen::Vector3d::UnitY()).toRotationMatrix(), Eigen::Vector3d(10, 0, 0));
+        Sophus::SE3d TBA_dis=TAB_dis.inverse();
+        Eigen::Vector3d pb=TBA_dis*circle[i];
+        Eigen::Vector2d uvb = (K * pb / pb.z()).topLeftCorner<2, 1>() ;
+
+//        uint8_t B_patch_ptr[patch_size * patch_size]  __attribute__ ((aligned (16)));
+//        uint8_t *patch_ptr_b = B_patch_ptr;
+//        computeCurrentFeaturePatch(uvb, patch_size, imgBPyr[0], patch_ptr_b, nullptr, nullptr);
+        bool res=align2D(matB,patch_ptr_a_wb,patch_ptr_a,10,true,false,uvb, false, nullptr);
+        if(res){
+            matches.emplace_back(ref_pts.size(),ref_pts.size(),1);
+            ref_pts.emplace_back(uva.x(),uva.y(),1);
+            cur_pts.emplace_back(uvb.x(),uvb.y(),1);
+
+        }
+    }
+    cv::Mat res;
+    cv::drawMatches(matA,ref_pts,matB,cur_pts,matches,res);
+    cv::imwrite("res.jpg",res);
 
     return 0;
 }
