@@ -411,7 +411,7 @@ bool align2D(
             for(int x=0; x<patch_size_; ++x, ++it, ++it_ref, ++it_ref_dx, ++it_ref_dy)
             {
                 float search_pixel = wTL*it[0] + wTR*it[1] + wBL*it[cur_step] + wBR*it[cur_step+1];
-                float res = search_pixel - alpha*(*it_ref) + mean_diff;
+                float res = search_pixel - alpha*(*it_ref) + mean_diff; // I_b-\alpha* I_a+ \beta
                 Jres[0] -= res*(*it_ref_dx);
                 Jres[1] -= res*(*it_ref_dy);
 
@@ -453,8 +453,8 @@ bool align2D(
         update = Hinv * Jres;
         u += update[0];
         v += update[1];
-        mean_diff += update[2];
-        alpha += update[3];
+        mean_diff -= update[2];
+        alpha -= update[3];
 
         if(each_step) each_step->push_back(Eigen::Vector2f(u, v));
 
@@ -516,8 +516,8 @@ int main() {
         }
     }
 //frame B
-    Eigen::Vector3d t(10,0,0);
-    Eigen::AngleAxisd ry=Eigen::AngleAxisd(-M_PI/4.0,Eigen::Vector3d::UnitY());
+    Eigen::Vector3d t(7,0.5,2);
+    Eigen::AngleAxisd ry=Eigen::AngleAxisd(-M_PI/3.0,Eigen::Vector3d::UnitY());
     Eigen::Matrix4d T_BA_GT;
     T_BA_GT.setIdentity();
     T_BA_GT.topLeftCorner<3,3>()=ry.toRotationMatrix().transpose();
@@ -867,37 +867,82 @@ int main() {
 
     std::vector<cv::KeyPoint> ref_pts,cur_pts;
     std::vector<cv::DMatch> matches;
-    for (int i = 0; i < circle.size(); i+=10) {
-        Eigen::Vector3d pa = circle[i];
-        pa /= pa.z();
-        Eigen::Vector2d uva = (K * pa).topLeftCorner<2, 1>();
+    std::vector<Eigen::Vector2d> searched_px;//at level 0
+    for (int i = 0; i < circle.size(); i++) {
+//        Eigen::Vector3d t(7,0.5,2);
+//        Eigen::AngleAxisd ry=Eigen::AngleAxisd(-M_PI/3.0,Eigen::Vector3d::UnitY());
+        Sophus::SE3d TAB_dis(Eigen::AngleAxisd(-M_PI / 3.2, Eigen::Vector3d::UnitY()).toRotationMatrix(),
+                             Eigen::Vector3d(6, 0.2, 2));
+        Sophus::SE3d TBA_dis = TAB_dis.inverse();
+        Eigen::Vector3d pb = TBA_dis * circle[i];
+        Eigen::Vector2d uvb = (K * pb / pb.z()).topLeftCorner<2, 1>();
+        searched_px.push_back(uvb);
+        for (int level = 3; level >=0; --level) {
+            double scale = n / 2.0;
+            std::cout << "current level " << level << std::endl;
+            scale /= (1 << level);
+            int search_level = std::log2(1.0 / scale)+0.5;
+            if (search_level > 3)
+                search_level = 3;
+            std::cout << "best search level " << search_level << std::endl;
+
+            cv::Point2f srcLev[4];
+            cv::Point2f dstLev[4];
+            for (int k = 0; k < 4; ++k) {
+                srcLev[k] = srcTri[k] / (1 << level);
+                dstLev[k] = dstTri[k] / (1 << search_level);
+            }
+            cv::Mat warp_BA_level = cv::getPerspectiveTransform(srcLev, dstLev);//A_ba
+//        std::cout<<" opencv "<<std::endl;
+//        std::cout<<warp_BA_level<<std::endl;
+
+            Eigen::Matrix<double, 3, 3> Wlevel;
+            Wlevel.setZero();
+            cv::cv2eigen(warp_BA_level, Wlevel);
+
+            Eigen::Vector3d pa = circle[i];
+            pa /= pa.z();
+            Eigen::Vector2d uva = (K * pa).topLeftCorner<2, 1>()/(1<<level);
 
 
-        uint8_t A_patch_ptr_wb[(patch_size+1) * (patch_size+1)]  __attribute__ ((aligned (16)));
-        uint8_t *patch_ptr_a_wb = A_patch_ptr_wb;
+            uint8_t A_patch_ptr_wb[(patch_size + 1) * (patch_size + 1)]  __attribute__ ((aligned (16)));
+            uint8_t *patch_ptr_a_wb = A_patch_ptr_wb;
 
-        uint8_t A_patch_ptr[(patch_size) * (patch_size)]  __attribute__ ((aligned (16)));
-        uint8_t *patch_ptr_a= A_patch_ptr;
+            uint8_t A_patch_ptr[(patch_size) * (patch_size)]  __attribute__ ((aligned (16)));
+            uint8_t *patch_ptr_a = A_patch_ptr;
 
-        make_patch_with_warp(halfpatch_size+1, uva, imgAPyr[0], patch_ptr_a_wb, Wba);//ref
-        createPatchFromPatchWithBorder(patch_ptr_a_wb,patch_size,patch_ptr_a);
+            make_patch_with_warp(halfpatch_size + 1, uva, imgAPyr[level], patch_ptr_a_wb, Wlevel);//ref
+            createPatchFromPatchWithBorder(patch_ptr_a_wb, patch_size, patch_ptr_a);
 
-        Sophus::SE3d TAB_dis(Eigen::AngleAxisd(-M_PI / 4.1, Eigen::Vector3d::UnitY()).toRotationMatrix(), Eigen::Vector3d(10, 0, 0));
-        Sophus::SE3d TBA_dis=TAB_dis.inverse();
-        Eigen::Vector3d pb=TBA_dis*circle[i];
-        Eigen::Vector2d uvb = (K * pb / pb.z()).topLeftCorner<2, 1>() ;
 
-//        uint8_t B_patch_ptr[patch_size * patch_size]  __attribute__ ((aligned (16)));
-//        uint8_t *patch_ptr_b = B_patch_ptr;
-//        computeCurrentFeaturePatch(uvb, patch_size, imgBPyr[0], patch_ptr_b, nullptr, nullptr);
-        bool res=align2D(matB,patch_ptr_a_wb,patch_ptr_a,10,true,false,uvb, false, nullptr);
-        if(res){
-            matches.emplace_back(ref_pts.size(),ref_pts.size(),1);
-            ref_pts.emplace_back(uva.x(),uva.y(),1);
-            cur_pts.emplace_back(uvb.x(),uvb.y(),1);
+            searched_px.back()/=(1<<search_level);
+            bool res = align2D(imgBPyr[search_level], patch_ptr_a_wb, patch_ptr_a, 10, true, false, searched_px.back(), false, nullptr);
+            searched_px.back()*=(1<<search_level);
 
+            if (res && level==0) {
+                Eigen::Vector3d uv=(Wba*Eigen::Vector3d(uva.x(), uva.y(), 1));
+                uv/=uv.z();
+                Eigen::Vector2d uvb(searched_px.back().x(),searched_px.back().y());
+                if((uv.head<2>()-uvb).norm()<5.0){
+                    matches.emplace_back(ref_pts.size(), ref_pts.size(), 1);
+                    ref_pts.emplace_back(uva.x(), uva.y(), 1);
+                    cur_pts.emplace_back(searched_px.back().x(), searched_px.back().y(), 1);
+                }
+            }
+        }
+
+    }
+
+    int error=0;
+    for (int i = 0; i < ref_pts.size(); ++i) {
+        Eigen::Vector3d uv=(Wba*Eigen::Vector3d(ref_pts[i].pt.x,ref_pts[i].pt.y,1.0));
+        uv/=uv.z();
+        Eigen::Vector2d uvb(cur_pts[i].pt.x,cur_pts[i].pt.y);
+        if((uv.head<2>()-uvb).norm()>5.0){
+            error++;
         }
     }
+    std::cout<<"success match "<<ref_pts.size()-error<<" all matches "<<ref_pts.size()<<std::endl;
     cv::Mat res;
     cv::drawMatches(matA,ref_pts,matB,cur_pts,matches,res);
     cv::imwrite("res.jpg",res);
